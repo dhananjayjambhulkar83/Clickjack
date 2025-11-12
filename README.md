@@ -37,7 +37,7 @@ cd clickjack
 
 ### 2️⃣ Install dependencies
 ```bash
-pip install -r requirements.txt
+pip3 install -r requirements.txt
 ```
 
 ---
