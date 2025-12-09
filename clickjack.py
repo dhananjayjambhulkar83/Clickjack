@@ -1,69 +1,79 @@
 #!/usr/bin/env python3
 """
-clickjack.py - uses external clickjacking.html
+clickjack.py – Complete Clickjacking Scanner
 
-Note:
-- Requires a file named `clickjacking.html` in the same directory.
-- That file should contain an <iframe> (or the script will inject one).
+Features:
+- Chrome + Selenium (headless by default)
+- Auto SSL fallback (verify=False)
+- Timeout / SSL / Unreachable labels
+- If iframe loads → [VULNERABLE]
+- Saves PoC HTML for vulnerable targets (./poc_html/)
+- Optional: save output to TXT (--save-txt)
 """
 
 from __future__ import annotations
 import argparse
 import os
 import re
-import sys
 import time
 import urllib3
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import certifi
 import requests
 from requests.exceptions import (
-    RequestException,
-    SSLError,
-    ConnectTimeout,
-    ConnectionError,
+    RequestException, SSLError, ConnectTimeout,
+    ConnectionError
 )
 
 from selenium import webdriver
-from selenium.common.exceptions import WebDriverException, TimeoutException
+from selenium.common.exceptions import WebDriverException
 from selenium.webdriver.common.by import By
 
-# ----- Chrome -----
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.chrome.service import Service as ChromeService
 from webdriver_manager.chrome import ChromeDriverManager
 
+from urllib.parse import urlparse
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ---------- Config ----------
 USER_AGENT = "clickjack-externalhtml/1.0"
 LOCAL_POC_NAME = "clickjacking.html"
+POC_OUTPUT_DIR = "poc_html"
+LOG_FILE: Optional[str] = None
 
 
-# ---------- HELPERS ----------
+# ================= LOGGING =================
+def log(text: str):
+    print(text)
+    global LOG_FILE
+    if LOG_FILE:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(text + "\n")
+
+
+# ================= HELPERS =================
 def ensure_scheme_try_both(t: str) -> List[str]:
-    """If URL has no scheme, try https:// and http://."""
-    if re.match(r'^[a-zA-Z][a-zA-Z0-9+\-.]*://', t):
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+\-.]*://", t):
         return [t]
     return [f"https://{t}", f"http://{t}"]
 
 
-def parse_xfo(v: Optional[str]) -> Optional[str]:
-    if not v:
+def parse_xfo(val: Optional[str]) -> Optional[str]:
+    if not val:
         return None
-    v_up = v.strip().upper()
-    if "DENY" in v_up:
+    v = val.strip().upper()
+    if "DENY" in v:
         return "DENY"
-    if "SAMEORIGIN" in v_up:
+    if "SAMEORIGIN" in v:
         return "SAMEORIGIN"
-    if "ALLOW-FROM" in v_up:
+    if "ALLOW-FROM" in v:
         return "ALLOW-FROM"
-    return v_up
+    return v
 
 
 def headers_block_framing(headers: Dict[str, str]):
-    """Return (blocked: bool, reason: str) based on XFO / CSP."""
     xfo = headers.get("X-Frame-Options") or headers.get("x-frame-options")
     csp = headers.get("Content-Security-Policy") or headers.get("content-security-policy")
 
@@ -73,19 +83,18 @@ def headers_block_framing(headers: Dict[str, str]):
             return True, f"Header blocks framing: X-Frame-Options={xfo}"
 
     if csp and "frame-ancestors" in csp.lower():
-        return True, "Header blocks framing: CSP frame-ancestors present"
+        return True, "Header blocks framing: CSP frame-ancestors exists"
 
     return False, "No blocking headers"
 
 
-# ---------- BROWSER ----------
+# ================= BROWSER =================
 def start_browser(visible: bool):
-    """Start Chrome using webdriver-manager."""
     opts = ChromeOptions()
     if not visible:
         opts.add_argument("--headless=new")
-    opts.add_argument("--disable-gpu")
     opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument(f"--user-agent={USER_AGENT}")
 
@@ -94,240 +103,263 @@ def start_browser(visible: bool):
     return webdriver.Chrome(service=service, options=opts)
 
 
-# ---------- PoC ----------
-def prepare_external_poc(target_url: str) -> str:
-    """
-    Use clickjacking.html in current dir.
-    - Replace first iframe src with target_url, or
-    - Inject new iframe if none exist.
-    """
-    poc = os.path.join(os.getcwd(), LOCAL_POC_NAME)
-    if not os.path.exists(poc):
-        raise FileNotFoundError(f"{LOCAL_POC_NAME} not found in current directory.")
-
-    with open(poc, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    iframe_pattern = re.compile(r'(<iframe\b[^>]*\bsrc\s*=\s*")[^"]*(")', re.IGNORECASE)
-
-    if iframe_pattern.search(content):
-        new = iframe_pattern.sub(r'\1' + target_url + r'\2', content, count=1)
-    else:
-        iframe = (
-            f'\n<iframe id="cjframe" src="{target_url}" width="1000" height="700" '
-            f'style="border:3px solid #333;"></iframe>\n'
-        )
-        if "</body>" in content.lower():
-            new = re.sub(r'</body>', iframe + "</body>", content, flags=re.IGNORECASE)
-        else:
-            new = content + iframe
-
-    with open(poc, "w", encoding="utf-8") as f:
-        f.write(new)
-
-    return poc
+# ============== POC TEMPLATE ===============
+def load_poc_template() -> str:
+    if not os.path.exists(LOCAL_POC_NAME):
+        raise FileNotFoundError(f"{LOCAL_POC_NAME} not found!")
+    with open(LOCAL_POC_NAME, "r", encoding="utf-8") as f:
+        return f.read()
 
 
-# ---------- FRAME CHECK ----------
-def iframe_render_check(poc_path: str, headless: bool, timeout: int, retries: int, verbose: bool):
-    """
-    Load local PoC and see if we can successfully switch into iframe.
-    If yes => page is framable => VULNERABLE.
-    """
-    last_error = None
+def generate_poc_html(template: str, target: str) -> str:
+    pattern = re.compile(r'(<iframe\b[^>]*\bsrc\s*=\s*")[^"]*(")', re.IGNORECASE)
+    if pattern.search(template):
+        return pattern.sub(r"\1" + target + r"\2", template, count=1)
 
-    for attempt in range(retries + 1):
+    iframe = (
+        f'\n<iframe id="cjframe" src="{target}" width="1000" height="700" '
+        f'style="border:3px solid #333;"></iframe>\n'
+    )
+
+    if "</body>" in template.lower():
+        return re.sub(r"</body>", iframe + "</body>", template, flags=re.IGNORECASE)
+
+    return template + iframe
+
+
+def write_temp_poc(html: str) -> str:
+    path = "_clickjack_tmp.html"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return path
+
+
+def save_vuln_poc(target: str, html: str) -> str:
+    os.makedirs(POC_OUTPUT_DIR, exist_ok=True)
+    parsed = urlparse(target)
+
+    parts = [
+        parsed.scheme or "",
+        parsed.netloc or "",
+        parsed.path.strip("/").replace("/", "_") if parsed.path not in ["", "/"] else ""
+    ]
+
+    base = "_".join([x for x in parts if x])
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", base)
+    filename = f"{base}.html"
+
+    out = os.path.join(POC_OUTPUT_DIR, filename)
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(html)
+    return out
+
+
+# ============== FRAME CHECK ================
+def iframe_render_check(poc_path: str, headless: bool, timeout: int, retries: int):
+    last = None
+    for _ in range(retries + 1):
         driver = None
         try:
             driver = start_browser(visible=not headless)
             driver.set_page_load_timeout(max(30, timeout * 2))
 
-            driver.get(f"file://{poc_path}")
+            driver.get(f"file://{os.path.abspath(poc_path)}")
             time.sleep(1)
 
-            # Find iframe
             try:
                 iframe = driver.find_element(By.ID, "cjframe")
             except Exception:
                 try:
                     iframe = driver.find_element(By.TAG_NAME, "iframe")
                 except Exception:
-                    iframe = None
+                    driver.quit()
+                    return False, "No iframe found"
 
-            if iframe is None:
-                driver.quit()
-                return False, "No iframe found in PoC"
-
-            # If switching into the iframe works => page is framable
             try:
                 try:
                     driver.switch_to.frame("cjframe")
                 except Exception:
                     driver.switch_to.frame(iframe)
 
-                # Try to find body (may fail for cross-origin but still means frame loaded)
                 try:
                     driver.find_element(By.TAG_NAME, "body")
                 except Exception:
                     pass
 
                 driver.quit()
-                return True, "Iframe loaded successfully → framable"
+                return True, "Iframe loaded → framable"
 
             except WebDriverException:
                 driver.quit()
-                return False, "Browser prevented switching → not framable"
+                return False, "Frame blocked"
 
         except Exception as e:
-            last_error = e
+            last = e
             if driver:
                 driver.quit()
             time.sleep(1)
-            continue
 
-    return False, f"Browser error: {last_error}"
+    return False, f"Browser error: {last}"
 
 
-# ---------- TARGET CHECK ----------
-def check_one(
-    target: str, timeout: int, retries: int, no_verify: bool, headless: bool, only_vuln: bool, verbose: bool
-):
+# ============= MAIN URL CHECK =============
+def check_one(target: str, timeout: int, retries: int, no_verify: bool, headless: bool, only_vuln: bool):
     target = target.strip()
     if not target:
         return
 
-    used_url = None
-    headers: Dict[str, str] = {}
-    last_exc: Optional[Exception] = None
+    used = None
+    headers = {}
+    last_err = None
 
-    # Try HTTPS/HTTP
     for url in ensure_scheme_try_both(target):
         attempt = 0
         while attempt <= retries:
             try:
-                # primary attempt: normal verification (unless --no-verify)
                 verify_arg = False if no_verify else certifi.where()
                 resp = requests.get(
                     url,
                     headers={"User-Agent": USER_AGENT},
                     timeout=timeout,
                     verify=verify_arg,
-                    allow_redirects=True,
                 )
-                used_url = url
+                used = url
                 headers = resp.headers
                 break
 
-            except SSLError as ssl_err:
-                # automatic fallback: retry ONCE for this attempt with verify=False
-                last_exc = ssl_err
+            except SSLError as s:
+                last_err = s
                 try:
                     resp = requests.get(
                         url,
                         headers={"User-Agent": USER_AGENT},
                         timeout=timeout,
                         verify=False,
-                        allow_redirects=True,
                     )
-                    used_url = url
+                    used = url
                     headers = resp.headers
                     break
                 except Exception as e2:
-                    last_exc = e2
+                    last_err = e2
                     attempt += 1
-                    time.sleep(1)
                     continue
 
             except (ConnectTimeout, ConnectionError, RequestException) as e:
-                last_exc = e
+                last_err = e
                 attempt += 1
-                time.sleep(1)
                 continue
 
-        if used_url:
+        if used:
             break
 
-    # ---------- LABELED ERROR OUTPUT ----------
-    if not used_url:
+    if not used:
         if not only_vuln:
-            msg = (str(last_exc) or "").lower()
-
-            if "timed out" in msg or "timeout" in msg:
-                print(f"[TIMEOUT] {target} – Site not responding (connection timeout)")
-            elif "certificate" in msg or "ssl" in msg:
-                print(f"[SSL ERROR] {target} – SSL validation failed")
-            elif "failed to establish" in msg or "connection" in msg or "refused" in msg:
-                print(f"[UNREACHABLE] {target} – Network error / site not responding")
+            m = (str(last_err) or "").lower()
+            if "timeout" in m:
+                log(f"[TIMEOUT] {target} – Site not responding")
+            elif "ssl" in m or "certificate" in m:
+                log(f"[SSL ERROR] {target} – SSL validation failed")
+            elif "connection" in m:
+                log(f"[UNREACHABLE] {target} – Host unreachable")
             else:
-                print(f"[ERROR] {target} – {last_exc}")
+                log(f"[ERROR] {target} – {last_err}")
         return
 
-    # Header check
     blocked, reason = headers_block_framing(headers)
     if blocked:
         if not only_vuln:
-            print(f"[NOT VULNERABLE] {used_url} – {reason}")
+            log(f"[NOT VULNERABLE] {used} – {reason}")
         return
 
-    # PoC injection
     try:
-        poc = prepare_external_poc(used_url)
+        template = load_poc_template()
     except Exception as e:
-        if not only_vuln:
-            print(f"[ERROR] {used_url} – Failed PoC creation: {e}")
+        log(f"[ERROR] {used} – PoC template issue: {e}")
         return
 
-    # Browser test
-    vuln, message = iframe_render_check(poc, headless, timeout, retries, verbose)
+    html = generate_poc_html(template, used)
+    temp = write_temp_poc(html)
+
+    vuln, msg = iframe_render_check(temp, headless, timeout, retries)
 
     if vuln:
-        print(f"[VULNERABLE] {used_url}")
+        out = save_vuln_poc(used, html)
+        log(f"[VULNERABLE] {used} – PoC saved: {out}")
     else:
         if not only_vuln:
-            print(f"[NOT VULNERABLE] {used_url} – {message}")
+            log(f"[NOT VULNERABLE] {used} – {msg}")
 
 
-# ---------- CLI ----------
+# ================== MAIN ===================
 def main():
-    p = argparse.ArgumentParser()
-    group = p.add_mutually_exclusive_group(required=True)
-    group.add_argument("-u", "--url", help="Single URL to test")
-    group.add_argument("-f", "--file", help="File with URLs (one per line)")
+    global LOG_FILE
+    import sys
 
-    p.add_argument("--timeout", type=int, default=10, help="Request timeout (default 10s)")
-    p.add_argument("--retries", type=int, default=2, help="Number of retries on network errors")
-    p.add_argument("--no-verify", action="store_true", help="Force disable SSL verification for all requests")
-    p.add_argument("-v", "--verbose", action="store_true", help="Show real browser instead of headless")
-    p.add_argument("--only-vuln", action="store_true", help="Only print [VULNERABLE] lines")
+    # Custom handling for -h / --help BEFORE argparse runs
+    if any(h in sys.argv[1:] for h in ("-h", "--help")):
+        print("==============================================")
+        print("  CLICKJACKING SCANNER – HELP & OPTIONS")
+        print("==============================================")
+        print("Required:")
+        print("  -u URL              Test a single URL")
+        print("  -f FILE             Test URLs from a file")
+        print("")
+        print("Useful Flags:")
+        print("  --save-txt FILE     Save output to a log file")
+        print("  --only-vuln         Show only vulnerable URLs")
+        print("  --verbose           Show real browser window")
+        print("  --timeout N         Set timeout (default 10)")
+        print("  --retries N         Retry count (default 2)")
+        print("  --no-verify         Disable SSL checks")
+        print("")
+        print("Auto Features:")
+        print("  ✔ SSL fallback on error")
+        print("  ✔ Timeout / unreachable / SSL error labels")
+        print("  ✔ PoC saved for vulnerable sites → ./poc_html/")
+        print("==============================================")
+        print("")
+        print("Usage:")
+        print("  python clickjack.py -u URL [options]")
+        print("  python clickjack.py -f FILE [options]")
+        print("")
+        return
 
-    a = p.parse_args()
+    parser = argparse.ArgumentParser(description="Clickjacking Scanner (Chrome-based)")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("-u", "--url", help="Test a single URL")
+    group.add_argument("-f", "--file", help="Test multiple URLs from file")
 
-    if not a.only_vuln:
-        print("Note: Only test sites you own or have permission to test.\n")
-        print("Hints: if a host is slow/unreachable try: --timeout 30 --retries 3\n")
+    parser.add_argument("--timeout", type=int, default=10, help="Request/browser timeout (seconds)")
+    parser.add_argument("--retries", type=int, default=2, help="Retry count for network/browser issues")
+    parser.add_argument("--no-verify", action="store_true", help="Disable SSL certificate verification")
+    parser.add_argument("--only-vuln", action="store_true", help="Show only vulnerable results")
+    parser.add_argument("--verbose", action="store_true", help="Show visible Chrome browser")
+    parser.add_argument("--save-txt", metavar="FILE", help="Save output to a text file")
 
-    if a.url:
-        targets = [a.url]
+    args = parser.parse_args()
+
+    if args.save_txt:
+        LOG_FILE = args.save_txt
+        open(LOG_FILE, "w").close()
+
+    if args.url:
+        targets = [args.url]
     else:
-        with open(a.file, "r", encoding="utf-8") as f:
-            targets = [x.strip() for x in f.readlines() if x.strip()]
+        with open(args.file, "r", encoding="utf-8") as f:
+            targets = [x.strip() for x in f if x.strip()]
 
     for t in targets:
         try:
             check_one(
                 t,
-                timeout=a.timeout,
-                retries=a.retries,
-                no_verify=a.no_verify,
-                headless=not a.verbose,
-                only_vuln=a.only_vuln,
-                verbose=a.verbose,
+                timeout=args.timeout,
+                retries=args.retries,
+                no_verify=args.no_verify,
+                headless=not args.verbose,
+                only_vuln=args.only_vuln,
             )
-        except KeyboardInterrupt:
-            break
         except Exception as e:
-            if not a.only_vuln:
-                print(f"[ERROR] {t} – {e}")
+            log(f"[ERROR] {t} – {e}")
 
 
 if __name__ == "__main__":
