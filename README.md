@@ -20,10 +20,10 @@ Performs fast header-first checks (`X-Frame-Options` / CSP `frame-ancestors`) an
 
 ## 🧱 Requirements
 
-- 🐍 Python **3.8+**
-- 🦊 Firefox browser
-- ⚙️ GeckoDriver (must be in your PATH)
-- 📦 Python packages from `requirements.txt`
+- Python 3.8+
+- Google Chrome browser installed
+- ChromeDriver – handled automatically by webdriver-manager (no manual download needed)
+- Python packages from requirements.txt
 
 ---
 
@@ -76,6 +76,7 @@ python clickjack.py -f targets.txt --only-vuln
 | `--no-verify` | Skip SSL verification |
 | `-v, --verbose` | Show visible browser (manual inspection) |
 | `--only-vuln` | Show only vulnerable results |
+| `--save-txt FILE` | Also save all output lines to the given text file |
 
 ---
 
